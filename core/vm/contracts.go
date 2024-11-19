@@ -1446,7 +1446,7 @@ func (c *chatAssistant) Run(input []byte) ([]byte, error) {
 
 	// Create request body
 	reqBody := OpenAIRequest{
-		Model:     "gpt-4",
+		Model:     "gpt-4o-mini",
 		Seed:      13371337,
 		MaxTokens: 512,
 		Messages: []Message{
