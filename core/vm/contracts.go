@@ -1,28 +1,18 @@
-// Copyright 2014 The go-ethereum Authors
-// This file is part of the go-ethereum library.
-//
-// The go-ethereum library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// The go-ethereum library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
-
 package vm
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math/big"
+	"net/http"
+	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
@@ -39,6 +29,60 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"golang.org/x/crypto/ripemd160"
 )
+
+// OpenAI API request/response structures
+type OpenAIRequest struct {
+	Model     string    `json:"model"`
+	Seed      int       `json:"seed"`
+	MaxTokens int       `json:"max_tokens"`
+	Messages  []Message `json:"messages"`
+}
+
+type Message struct {
+	Role    string  `json:"role"`
+	Content string  `json:"content"`
+	Refusal *string `json:"refusal,omitempty"`
+}
+
+type OpenAIResponse struct {
+	ID                string   `json:"id"`
+	Object            string   `json:"object"`
+	Created           int64    `json:"created"`
+	Model             string   `json:"model"`
+	Choices           []Choice `json:"choices"`
+	Usage             Usage    `json:"usage"`
+	SystemFingerprint string   `json:"system_fingerprint"`
+	Error             *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type Choice struct {
+	Index        int     `json:"index"`
+	Message      Message `json:"message"`
+	LogProbs     *string `json:"logprobs"`
+	FinishReason string  `json:"finish_reason"`
+}
+
+type Usage struct {
+	PromptTokens           int                    `json:"prompt_tokens"`
+	CompletionTokens       int                    `json:"completion_tokens"`
+	TotalTokens            int                    `json:"total_tokens"`
+	PromptTokensDetails    TokenDetails           `json:"prompt_tokens_details"`
+	CompletionTokenDetails CompletionTokenDetails `json:"completion_tokens_details"`
+}
+
+type TokenDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+	AudioTokens  int `json:"audio_tokens"`
+}
+
+type CompletionTokenDetails struct {
+	ReasoningTokens          int `json:"reasoning_tokens"`
+	AudioTokens              int `json:"audio_tokens"`
+	AcceptedPredictionTokens int `json:"accepted_prediction_tokens"`
+	RejectedPredictionTokens int `json:"rejected_prediction_tokens"`
+}
 
 // PrecompiledContract is the basic interface for native Go contracts. The implementation
 // requires a deterministic gas count based on the input size of the Run method of the
@@ -90,15 +134,16 @@ var PrecompiledContractsIstanbul = PrecompiledContracts{
 // PrecompiledContractsBerlin contains the default set of pre-compiled Ethereum
 // contracts used in the Berlin release.
 var PrecompiledContractsBerlin = PrecompiledContracts{
-	common.BytesToAddress([]byte{0x1}): &ecrecover{},
-	common.BytesToAddress([]byte{0x2}): &sha256hash{},
-	common.BytesToAddress([]byte{0x3}): &ripemd160hash{},
-	common.BytesToAddress([]byte{0x4}): &dataCopy{},
-	common.BytesToAddress([]byte{0x5}): &bigModExp{eip2565: true},
-	common.BytesToAddress([]byte{0x6}): &bn256AddIstanbul{},
-	common.BytesToAddress([]byte{0x7}): &bn256ScalarMulIstanbul{},
-	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
-	common.BytesToAddress([]byte{0x9}): &blake2F{},
+	common.BytesToAddress([]byte{0x1}):              &ecrecover{},
+	common.BytesToAddress([]byte{0x2}):              &sha256hash{},
+	common.BytesToAddress([]byte{0x3}):              &ripemd160hash{},
+	common.BytesToAddress([]byte{0x4}):              &dataCopy{},
+	common.BytesToAddress([]byte{0x5}):              &bigModExp{eip2565: true},
+	common.BytesToAddress([]byte{0x6}):              &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{0x7}):              &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{0x8}):              &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{0x9}):              &blake2F{},
+	common.BytesToAddress([]byte{0xa1, 0xa1, 0xa1}): &chatAssistant{},
 }
 
 // PrecompiledContractsCancun contains the default set of pre-compiled Ethereum
@@ -1351,5 +1396,154 @@ func (c *p256Verify) Run(input []byte) ([]byte, error) {
 	} else {
 		// Signature is invalid
 		return nil, nil
+	}
+}
+
+type chatAssistant struct{}
+
+var (
+	errInvalidChatInput = errors.New("invalid chat input")
+	errOpenAITimeout    = errors.New("openai request timed out")
+)
+
+func (c *chatAssistant) RequiredGas(input []byte) uint64 {
+	return uint64(2000)
+}
+
+func (c *chatAssistant) Run(input []byte) ([]byte, error) {
+	// Check if input is at least 4 bytes (function selector)
+	if len(input) < 4 {
+		return nil, fmt.Errorf("%w: input too short, length=%d", errInvalidChatInput, len(input))
+	}
+
+	// Verify method signature
+	chatMethodID := crypto.Keccak256([]byte("chat(string)"))[0:4]
+	if !bytes.Equal(input[0:4], chatMethodID) {
+		return nil, fmt.Errorf("%w: invalid method signature", errInvalidChatInput)
+	}
+
+	// Decode the input string
+	if len(input) < 36 {
+		return nil, fmt.Errorf("%w: input too short for offset, length=%d", errInvalidChatInput, len(input))
+	}
+
+	// Get string offset
+	offset := new(big.Int).SetBytes(input[4:36]).Uint64()
+	if uint64(len(input)) < offset+36 {
+		return nil, fmt.Errorf("%w: input too short for string length, input_len=%d required_len=%d",
+			errInvalidChatInput, len(input), offset+36)
+	}
+
+	// Get string length
+	strLen := new(big.Int).SetBytes(input[36:68]).Uint64()
+	if uint64(len(input)) < 68+strLen {
+		return nil, fmt.Errorf("%w: input too short for string data, input_len=%d required_len=%d",
+			errInvalidChatInput, len(input), 68+strLen)
+	}
+
+	// Extract the message and create OpenAI request
+	message := string(input[68 : 68+strLen])
+
+	// Create request body
+	reqBody := OpenAIRequest{
+		Model:     "gpt-4",
+		Seed:      13371337,
+		MaxTokens: 512,
+		Messages: []Message{
+			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "user", Content: message},
+		},
+	}
+
+	// Marshal request to JSON
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	// Create request with context
+	req, err := http.NewRequestWithContext(ctx, "POST", params.OpenAIAPIURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if params.OpenAIAPIURL == "" || params.OpenAIAPIKey == "" {
+		return nil, fmt.Errorf("OpenAI API URL or key is not set")
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+params.OpenAIAPIKey)
+
+	// Create HTTP client (no need for client timeout since we're using context)
+	client := &http.Client{}
+
+	// Make the request
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, errOpenAITimeout
+		}
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body with context timeout
+	bodyChan := make(chan []byte)
+	errChan := make(chan error)
+
+	go func() {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errChan <- err
+			return
+		}
+		bodyChan <- body
+	}()
+
+	// Wait for either response or timeout
+	select {
+	case <-ctx.Done():
+		return nil, errOpenAITimeout
+	case err := <-errChan:
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	case body := <-bodyChan:
+		// Continue processing response
+		var aiResp OpenAIResponse
+		if err := json.Unmarshal(body, &aiResp); err != nil {
+			return nil, fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		// Check for API error
+		if aiResp.Error != nil {
+			return nil, fmt.Errorf("OpenAI API error: %s", aiResp.Error.Message)
+		}
+
+		// Get response text
+		if len(aiResp.Choices) == 0 {
+			return nil, fmt.Errorf("no response from OpenAI")
+		}
+		response := aiResp.Choices[0].Message.Content
+
+		// ABI encode the string response
+		strLen = uint64(len(response))
+		paddedStrLen := (strLen + 31) / 32 * 32
+
+		encoded := make([]byte, 32+32+paddedStrLen)
+
+		// Offset (32)
+		copy(encoded[28:32], []byte{0, 0, 0, 32})
+
+		// String length
+		copy(encoded[60:64], []byte{0, 0, 0, byte(strLen)})
+
+		// String data
+		copy(encoded[64:], response)
+
+		return encoded, nil
 	}
 }

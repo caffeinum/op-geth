@@ -919,6 +919,15 @@ var (
 		Category: flags.GasPriceCategory,
 	}
 
+	// OpenAI settings
+	OpenAIAPIKeyFlag = &cli.StringFlag{
+		Name:     "openai.apikey",
+		Usage:    "OpenAI API key for AI-assisted operations",
+		Value:    "",
+		Category: flags.APICategory,
+		EnvVars:  []string{"GETH_OPENAI_API_KEY"},
+	}
+
 	// Rollup Flags
 	RollupSequencerHTTPFlag = &cli.StringFlag{
 		Name:     "rollup.sequencerhttp",

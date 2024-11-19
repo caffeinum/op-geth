@@ -281,6 +281,12 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 			utils.Fatalf("failed to register catalyst service: %v", err)
 		}
 	}
+
+	// Set OpenAI API key from flags
+	if ctx.IsSet(utils.OpenAIAPIKeyFlag.Name) {
+		params.SetOpenAIAPIKey(ctx.String(utils.OpenAIAPIKeyFlag.Name))
+	}
+
 	return stack
 }
 
