@@ -1571,20 +1571,35 @@ func (c *chatAssistant) Run(input []byte) ([]byte, error) {
 		}
 		response := aiResp.Choices[0].Message.Content
 
+		// Ensure response doesn't exceed maximum size
+		// Maximum size for RPC responses (512 tokens, one token is approx 4 chars)
+		const maxResponseSize = 512 * 4
+		if len(response) > maxResponseSize {
+			response = response[:maxResponseSize]
+		}
+
+		// log the response
+		fmt.Printf("OpenAI response: %s\n", response)
+
 		// ABI encode the string response
-		strLen = uint64(len(response))
+		strLen := uint64(len(response))
 		paddedStrLen := (strLen + 31) / 32 * 32
 
-		encoded := make([]byte, 32+32+paddedStrLen)
+		encoded := make([]byte, 64+paddedStrLen) // 32 for offset + 32 for length + string data
 
 		// Offset (32)
-		copy(encoded[28:32], []byte{0, 0, 0, 32})
+		binary.BigEndian.PutUint64(encoded[24:32], 32)
 
 		// String length
-		copy(encoded[60:64], []byte{0, 0, 0, byte(strLen)})
+		binary.BigEndian.PutUint64(encoded[56:64], strLen)
 
 		// String data
 		copy(encoded[64:], response)
+
+		// Pad remaining bytes with zeros
+		for i := 64 + strLen; i < uint64(len(encoded)); i++ {
+			encoded[i] = 0
+		}
 
 		return encoded, nil
 	}
