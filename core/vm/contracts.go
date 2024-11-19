@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto/bn256"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/crypto/secp256r1"
+
 	"github.com/ethereum/go-ethereum/params"
 	"golang.org/x/crypto/ripemd160"
 )
@@ -1504,7 +1505,7 @@ func (c *chatAssistant) Run(input []byte) ([]byte, error) {
 	}
 
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second-1*time.Second)
 	defer cancel()
 
 	// Create request with context
