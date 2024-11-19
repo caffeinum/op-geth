@@ -1407,7 +1407,49 @@ var (
 )
 
 func (c *chatAssistant) RequiredGas(input []byte) uint64 {
-	return uint64(2000)
+	// Base cost for the API call
+	baseCost := uint64(2000)
+
+	// If input is invalid, return base cost
+	if len(input) < 68 {
+		return baseCost
+	}
+
+	// Get input string length
+	strLen := new(big.Int).SetBytes(input[36:68]).Uint64()
+	if uint64(len(input)) < 68+strLen {
+		return baseCost
+	}
+
+	// Estimate tokens (roughly 4 chars per token)
+	inputTokens := (strLen + 3) / 4
+	// Estimate output tokens (assume 2x input)
+	outputTokens := inputTokens * 2
+
+	// Calculate costs in USD (multiply by 1e6 for precision)
+	// Input: $0.15 per 1M tokens = $0.00000015 per token
+	inputCost := new(big.Int).SetUint64(inputTokens * 15 / 100000)
+	// Output: $0.60 per 1M tokens = $0.0000006 per token
+	outputCost := new(big.Int).SetUint64(outputTokens * 60 / 100000)
+
+	// Total cost in USD (with 6 decimal precision)
+	totalCostUSD := new(big.Int).Add(inputCost, outputCost)
+
+	// Convert USD to ETH (1 ETH = $3000)
+	// Multiply by 1e18 (wei) and divide by 3000
+	totalCostWei := new(big.Int).Mul(totalCostUSD, big.NewInt(1e18))
+	totalCostWei.Div(totalCostWei, big.NewInt(3000))
+
+	// Convert to gas (1 gas = 1e9 wei)
+	gas := new(big.Int).Div(totalCostWei, big.NewInt(1e9))
+
+	// Add base cost and ensure minimum gas
+	gas.Add(gas, big.NewInt(int64(baseCost)))
+
+	if gas.IsUint64() {
+		return gas.Uint64()
+	}
+	return baseCost
 }
 
 func (c *chatAssistant) Run(input []byte) ([]byte, error) {
