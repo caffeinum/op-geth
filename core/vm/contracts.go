@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"maps"
 	"math/big"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -1407,6 +1409,13 @@ var (
 	errOpenAITimeout    = errors.New("openai request timed out")
 )
 
+var (
+	chatMethodID      = crypto.Keccak256([]byte("chat(string,string)"))[0:4]
+	chatBytesMethodID = crypto.Keccak256([]byte("chat_bytes(string,string)"))[0:4]
+	chatBoolMethodID  = crypto.Keccak256([]byte("chat_bool(string,string)"))[0:4]
+	chatUintMethodID  = crypto.Keccak256([]byte("chat_uint(string,string)"))[0:4]
+)
+
 func (c *chatAssistant) RequiredGas(input []byte) uint64 {
 	// Base cost for the API call
 	baseCost := uint64(2000)
@@ -1453,62 +1462,58 @@ func (c *chatAssistant) RequiredGas(input []byte) uint64 {
 	return baseCost
 }
 
-func (c *chatAssistant) Run(input []byte) ([]byte, error) {
-	// Check if input is at least 4 bytes (function selector)
-	if len(input) < 4 {
-		return nil, fmt.Errorf("%w: input too short, length=%d", errInvalidChatInput, len(input))
+// Add helper to decode two strings
+func (c *chatAssistant) decodeTwoStrings(input []byte) (string, string, error) {
+	if len(input) < 68 {
+		return "", "", fmt.Errorf("%w: input too short for offsets", errInvalidChatInput)
 	}
 
-	// Verify method signature
-	chatMethodID := crypto.Keccak256([]byte("chat(string)"))[0:4]
-	if !bytes.Equal(input[0:4], chatMethodID) {
-		return nil, fmt.Errorf("%w: invalid method signature", errInvalidChatInput)
+	// Skip method ID (4 bytes) and get string offsets
+	// Each offset is 32 bytes, pointing to where each string starts
+	offset1 := new(big.Int).SetBytes(input[4:36]).Uint64()
+	offset2 := new(big.Int).SetBytes(input[36:68]).Uint64()
+
+	// Check if input is long enough to contain both strings
+	if uint64(len(input)) < offset1+32 || uint64(len(input)) < offset2+32 {
+		return "", "", fmt.Errorf("%w: input too short for string lengths", errInvalidChatInput)
 	}
 
-	// Decode the input string
-	if len(input) < 36 {
-		return nil, fmt.Errorf("%w: input too short for offset, length=%d", errInvalidChatInput, len(input))
+	// Get string lengths (each length is 32 bytes)
+	// Need to add 4 to account for method ID
+	strLen1 := new(big.Int).SetBytes(input[offset1+4:offset1+36]).Uint64()
+	strLen2 := new(big.Int).SetBytes(input[offset2+4:offset2+36]).Uint64()
+
+	// Check if input is long enough to contain string data
+	if uint64(len(input)) < offset1+36+strLen1 || uint64(len(input)) < offset2+36+strLen2 {
+		return "", "", fmt.Errorf("%w: input too short for string data", errInvalidChatInput)
 	}
 
-	// Get string offset
-	offset := new(big.Int).SetBytes(input[4:36]).Uint64()
-	if uint64(len(input)) < offset+36 {
-		return nil, fmt.Errorf("%w: input too short for string length, input_len=%d required_len=%d",
-			errInvalidChatInput, len(input), offset+36)
-	}
+	// Extract the actual strings
+	str1 := string(input[offset1+36:offset1+36+strLen1])
+	str2 := string(input[offset2+36:offset2+36+strLen2])
 
-	// Get string length
-	strLen := new(big.Int).SetBytes(input[36:68]).Uint64()
-	if uint64(len(input)) < 68+strLen {
-		return nil, fmt.Errorf("%w: input too short for string data, input_len=%d required_len=%d",
-			errInvalidChatInput, len(input), 68+strLen)
-	}
+	return str1, str2, nil
+}
 
-	// Extract the message and create OpenAI request
-	message := string(input[68 : 68+strLen])
+func (c *chatAssistant) makeOpenAIRequest(ctx context.Context, systemPrompt, message string) (*OpenAIResponse, error) {
+	fmt.Println("[OpenAI System Prompt]:", systemPrompt)
+	fmt.Println("[OpenAI Message]:", message)
 
-	// Create request body
 	reqBody := OpenAIRequest{
 		Model:     "gpt-4o-mini",
 		Seed:      13371337,
 		MaxTokens: 512,
 		Messages: []Message{
-			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: message},
 		},
 	}
 
-	// Marshal request to JSON
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second-1*time.Second)
-	defer cancel()
-
-	// Create request with context
 	req, err := http.NewRequestWithContext(ctx, "POST", params.OpenAIAPIURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -1518,14 +1523,10 @@ func (c *chatAssistant) Run(input []byte) ([]byte, error) {
 		return nil, fmt.Errorf("OpenAI API URL or key is not set")
 	}
 
-	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+params.OpenAIAPIKey)
 
-	// Create HTTP client (no need for client timeout since we're using context)
 	client := &http.Client{}
-
-	// Make the request
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -1535,73 +1536,256 @@ func (c *chatAssistant) Run(input []byte) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	// Read response body with context timeout
-	bodyChan := make(chan []byte)
-	errChan := make(chan error)
-
-	go func() {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		bodyChan <- body
-	}()
-
-	// Wait for either response or timeout
-	select {
-	case <-ctx.Done():
-		return nil, errOpenAITimeout
-	case err := <-errChan:
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
-	case body := <-bodyChan:
-		// Continue processing response
-		var aiResp OpenAIResponse
-		if err := json.Unmarshal(body, &aiResp); err != nil {
-			return nil, fmt.Errorf("failed to parse response: %w", err)
-		}
-
-		// Check for API error
-		if aiResp.Error != nil {
-			return nil, fmt.Errorf("OpenAI API error: %s", aiResp.Error.Message)
-		}
-
-		// Get response text
-		if len(aiResp.Choices) == 0 {
-			return nil, fmt.Errorf("no response from OpenAI")
-		}
-		response := aiResp.Choices[0].Message.Content
-
-		// Ensure response doesn't exceed maximum size
-		// Maximum size for RPC responses (512 tokens, one token is approx 4 chars)
-		const maxResponseSize = 512 * 4
-		if len(response) > maxResponseSize {
-			response = response[:maxResponseSize]
-		}
-
-		// log the response
-		fmt.Printf("OpenAI response: %s\n", response)
-
-		// ABI encode the string response
-		strLen := uint64(len(response))
-		paddedStrLen := (strLen + 31) / 32 * 32
-
-		encoded := make([]byte, 64+paddedStrLen) // 32 for offset + 32 for length + string data
-
-		// Offset (32)
-		binary.BigEndian.PutUint64(encoded[24:32], 32)
-
-		// String length
-		binary.BigEndian.PutUint64(encoded[56:64], strLen)
-
-		// String data
-		copy(encoded[64:], response)
-
-		// Pad remaining bytes with zeros
-		for i := 64 + strLen; i < uint64(len(encoded)); i++ {
-			encoded[i] = 0
-		}
-
-		return encoded, nil
 	}
+
+	var aiResp OpenAIResponse
+	if err := json.Unmarshal(body, &aiResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	fmt.Println("[OpenAI Response]:", aiResp.Choices[0].Message.Content)
+
+	return &aiResp, nil
+}
+
+func (c *chatAssistant) Run(input []byte) ([]byte, error) {
+	if len(input) < 4 {
+		return nil, fmt.Errorf("%w: input too short, length=%d", errInvalidChatInput, len(input))
+	}
+
+	methodID := input[0:4]
+	switch {
+	case bytes.Equal(methodID, chatMethodID):
+		return c.handleChat(input)
+	case bytes.Equal(methodID, chatBytesMethodID):
+		return c.handleChatBytes(input)
+	case bytes.Equal(methodID, chatBoolMethodID):
+		return c.handleChatBool(input)
+	case bytes.Equal(methodID, chatUintMethodID):
+		return c.handleChatUint(input)
+	default:
+		return nil, fmt.Errorf("%w: invalid method signature", errInvalidChatInput)
+	}
+}
+
+// Update handlers to use two parameters
+func (c *chatAssistant) handleChat(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	if systemPrompt == "" {
+		systemPrompt = "You are a helpful assistant."
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+
+	// Ensure response doesn't exceed maximum size
+	const maxResponseSize = 512 * 4
+	if len(response) > maxResponseSize {
+		response = response[:maxResponseSize]
+	}
+
+	// ABI encode the string response
+	strLen := uint64(len(response))
+	paddedStrLen := (strLen + 31) / 32 * 32
+
+	encoded := make([]byte, 64+paddedStrLen)
+	binary.BigEndian.PutUint64(encoded[24:32], 32)
+	binary.BigEndian.PutUint64(encoded[56:64], strLen)
+	copy(encoded[64:], response)
+
+	return encoded, nil
+}
+
+func (c *chatAssistant) handleChatBytes(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	systemPrompt += `
+You are a smart contract helper that MUST return hex data.
+IMPORTANT: Your response should end with a single line containing ONLY a hex string.
+- The hex string can optionally start with '0x'
+- Use only characters 0-9 and a-f (or A-F)
+- The length must be even (pad with leading 0 if needed)
+
+Examples of valid final lines:
+0x0123456789abcdef
+0x00
+0xdeadbeef
+deadbeef
+00
+
+After any explanation, your last line MUST follow this format.`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+	lines := strings.Split(response, "\n")
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("empty response")
+	}
+
+	// Get the last non-empty line
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+
+	// Remove 0x prefix if present
+	lastLine = strings.TrimPrefix(lastLine, "0x")
+
+	// Clean the hex string
+	cleanedHex := strings.Map(func(r rune) rune {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			return r
+		}
+		return -1
+	}, lastLine)
+
+	// Ensure even length by padding with leading zero if needed
+	if len(cleanedHex)%2 != 0 {
+		cleanedHex = "0" + cleanedHex
+	}
+
+	if cleanedHex == "" {
+		return nil, fmt.Errorf("invalid hex string: no valid hex characters found")
+	}
+
+	// Decode hex string
+	return hex.DecodeString(cleanedHex)
+}
+
+func (c *chatAssistant) handleChatBool(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	systemPrompt += `
+You are a smart contract helper that MUST return true or false.
+IMPORTANT: After any explanation, your response MUST end with a single line containing ONLY the word 'true' or 'false' (lowercase).
+
+Examples of valid final lines:
+true
+false
+
+Your last line MUST be exactly 'true' or 'false' - nothing else.`
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+	lines := strings.Split(response, "\n")
+
+	// Get the last non-empty line
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+
+	result := strings.ToLower(lastLine) == "true"
+	encoded := make([]byte, 32)
+	if result {
+		encoded[31] = 1
+	}
+
+	return encoded, nil
+}
+
+func (c *chatAssistant) handleChatUint(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	systemPrompt += `
+You are a smart contract helper that MUST return a non-negative integer.
+IMPORTANT: After any explanation, your response MUST end with a single line containing ONLY digits (0-9).
+- No decimal points
+- No commas
+- No text or units
+- No scientific notation
+- Just plain digits
+
+Examples of valid final lines:
+0
+123456789
+1000000
+
+Your last line MUST contain ONLY digits - nothing else.`
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+	lines := strings.Split(response, "\n")
+
+	// Get the last non-empty line
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+
+	// Parse the uint, removing any non-numeric characters
+	cleanedLine := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, lastLine)
+
+	if cleanedLine == "" {
+		return nil, fmt.Errorf("invalid uint value: no numeric value found")
+	}
+
+	value := new(big.Int)
+	value, ok := value.SetString(cleanedLine, 10)
+	if !ok || value.Sign() < 0 {
+		return nil, fmt.Errorf("invalid uint value: %s", lastLine)
+	}
+
+	encoded := make([]byte, 32)
+	value.FillBytes(encoded)
+
+	return encoded, nil
 }
