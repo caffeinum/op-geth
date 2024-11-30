@@ -201,7 +201,7 @@ func TestChatAssistantEVMCalls(t *testing.T) {
 	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
 	address := common.HexToAddress("0x0000000000000000000000000000000000000100")
 	caller := common.HexToAddress("0x0000000000000000000000000000000000000001")
-	aiPrecompileAddress := common.HexToAddress("0x000000000000000000000000000000a1a1a1")
+	aiPrecompileAddress := common.HexToAddress("0x0000000000000000000000000000000000a1a1a1")
 
 	tests := []struct {
 		name         string
