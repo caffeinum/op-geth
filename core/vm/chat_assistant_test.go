@@ -2,10 +2,15 @@ package vm
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math/big"
 	"os"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/params"
@@ -152,6 +157,200 @@ func TestChatAssistant(t *testing.T) {
 					t.Errorf("chatAssistant.Run() = %v, want 'Hello world'", response)
 				}
 			}
+		})
+	}
+}
+
+type mockChatAssistant struct {
+	chatAssistant   // Embed the real chatAssistant to match its type
+	runCalled       bool
+	runStaticCalled bool
+	returnValue     []byte
+	err             error
+}
+
+func (m *mockChatAssistant) RequiredGas(input []byte) uint64 {
+	return 100000
+}
+
+func (m *mockChatAssistant) Run(input []byte) ([]byte, error) {
+	m.runCalled = true
+	return m.returnValue, m.err
+}
+
+func (m *mockChatAssistant) RunStaticCall(input []byte) ([]byte, error) {
+	m.runStaticCalled = true
+	return m.returnValue, m.err
+}
+
+func TestChatAssistantEVMCalls(t *testing.T) {
+	// Skip if no API key is set
+	apiKey := os.Getenv("GETH_OPENAI_API_KEY")
+	if apiKey == "" {
+		t.Skip("Skipping test: OPENAI_API_KEY not set")
+	}
+
+	// Save original API key and restore after tests
+	originalAPIKey := params.OpenAIAPIKey
+	defer func() {
+		params.OpenAIAPIKey = originalAPIKey
+	}()
+	params.OpenAIAPIKey = apiKey
+
+	// Setup mock state and accounts
+	statedb, _ := state.New(types.EmptyRootHash, state.NewDatabaseForTesting())
+	address := common.HexToAddress("0x0000000000000000000000000000000000000100")
+	caller := common.HexToAddress("0x0000000000000000000000000000000000000001")
+	aiPrecompileAddress := common.HexToAddress("0x000000000000000000000000000000a1a1a1")
+
+	tests := []struct {
+		name         string
+		isStaticCall bool
+
+		systemPrompt     string
+		message          string
+		wantRunCalled    bool
+		wantStaticCalled bool
+		wantError        bool
+		wantResponse     string
+	}{
+		{
+			name:             "regular call executes Run",
+			isStaticCall:     false,
+			systemPrompt:     "You are a helpful assistant. Please respond with exactly: Hello world",
+			message:          "Please say Hello world",
+			wantRunCalled:    true,
+			wantStaticCalled: false,
+			wantResponse:     "Hello world",
+		},
+		{
+			name:             "static call executes RunStaticCall",
+			isStaticCall:     true,
+			systemPrompt:     "test",
+			message:          "test",
+			wantRunCalled:    false,
+			wantStaticCalled: true,
+			wantResponse:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create real chatAssistant
+			assistant := &chatAssistant{}
+
+			// Register mock precompile
+			precompiles := PrecompiledContractsBerlin
+			precompiles[address] = assistant
+
+			blockCtx := BlockContext{
+				CanTransfer: func(StateDB, common.Address, *uint256.Int) bool { return true },
+				Transfer:    func(StateDB, common.Address, common.Address, *uint256.Int) {},
+				BlockNumber: big.NewInt(1),
+				Time:        1,
+				Difficulty:  big.NewInt(1),
+			}
+
+			txCtx := TxContext{
+				GasPrice: big.NewInt(1),
+				Origin:   caller,
+			}
+
+			evm := NewEVM(blockCtx, txCtx, statedb, params.TestChainConfig, Config{})
+			evm.precompiles = precompiles
+
+			_ = NewContract(
+				AccountRef(caller),
+				AccountRef(address),
+				uint256.NewInt(0),
+				200000,
+			)
+
+			var ret []byte
+			var err error
+
+			var input []byte
+
+			// Method selector (4 bytes)
+			input = append(input, chatMethodID...)
+
+			// Offset for first string (32 bytes)
+			offset1 := make([]byte, 32)
+			binary.BigEndian.PutUint64(offset1[24:], 64) // First string starts at byte 64
+			input = append(input, offset1...)
+
+			// Offset for second string (32 bytes)
+			offset2 := make([]byte, 32)
+			binary.BigEndian.PutUint64(offset2[24:], uint64(96+((len(tt.systemPrompt)+31)/32)*32)) // Second string starts after first string
+			input = append(input, offset2...)
+
+			// Length of first string (32 bytes)
+			length1 := make([]byte, 32)
+			binary.BigEndian.PutUint64(length1[24:], uint64(len(tt.systemPrompt)))
+			input = append(input, length1...)
+
+			// Data of first string (padded to 32 byte boundary)
+			data1 := make([]byte, (len(tt.systemPrompt)+31)/32*32)
+			copy(data1, tt.systemPrompt)
+			input = append(input, data1...)
+
+			// Length of second string (32 bytes)
+			length2 := make([]byte, 32)
+			binary.BigEndian.PutUint64(length2[24:], uint64(len(tt.message)))
+			input = append(input, length2...)
+
+			// Data of second string (padded to 32 byte boundary)
+			data2 := make([]byte, (len(tt.message)+31)/32*32)
+			copy(data2, tt.message)
+			input = append(input, data2...)
+
+			if tt.isStaticCall {
+				// Test static call
+				// Call directly 0xa1a1a1 address
+
+				ret, _, err = evm.StaticCall(
+					AccountRef(caller),
+					aiPrecompileAddress,
+					input,
+					200000,
+				)
+			} else {
+				// Test regular call
+				ret, _, err = evm.Call(
+					AccountRef(caller),
+					aiPrecompileAddress,
+					input,
+					200000,
+					uint256.NewInt(0),
+				)
+			}
+
+			// Verify the correct method was called
+			// check response
+			if err == nil {
+				// For non-empty responses, decode the ABI-encoded string
+				if len(ret) > 0 {
+					// Skip first 32 bytes (offset)
+					// Next 32 bytes contain string length
+					strLen := binary.BigEndian.Uint64(ret[32+24 : 64])
+					// String data starts at offset 64
+					response := string(ret[64 : 64+strLen])
+					if response != tt.wantResponse {
+						t.Errorf("got response %q, want %q", response, tt.wantResponse)
+					}
+				} else if tt.wantResponse != "" {
+					t.Errorf("got empty response, want %q", tt.wantResponse)
+				}
+			}
+
+			// Verify error handling
+			if tt.wantError && err == nil {
+				t.Error("expected error but got none")
+			}
+			if !tt.wantError && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
 		})
 	}
 }
