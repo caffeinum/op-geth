@@ -137,15 +137,16 @@ var PrecompiledContractsIstanbul = PrecompiledContracts{
 // PrecompiledContractsBerlin contains the default set of pre-compiled Ethereum
 // contracts used in the Berlin release.
 var PrecompiledContractsBerlin = PrecompiledContracts{
-	common.BytesToAddress([]byte{0x1}): &ecrecover{},
-	common.BytesToAddress([]byte{0x2}): &sha256hash{},
-	common.BytesToAddress([]byte{0x3}): &ripemd160hash{},
-	common.BytesToAddress([]byte{0x4}): &dataCopy{},
-	common.BytesToAddress([]byte{0x5}): &bigModExp{eip2565: true},
-	common.BytesToAddress([]byte{0x6}): &bn256AddIstanbul{},
-	common.BytesToAddress([]byte{0x7}): &bn256ScalarMulIstanbul{},
-	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
-	common.BytesToAddress([]byte{0x9}): &blake2F{},
+	common.BytesToAddress([]byte{0x1}):              &ecrecover{},
+	common.BytesToAddress([]byte{0x2}):              &sha256hash{},
+	common.BytesToAddress([]byte{0x3}):              &ripemd160hash{},
+	common.BytesToAddress([]byte{0x4}):              &dataCopy{},
+	common.BytesToAddress([]byte{0x5}):              &bigModExp{eip2565: true},
+	common.BytesToAddress([]byte{0x6}):              &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{0x7}):              &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{0x8}):              &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{0x9}):              &blake2F{},
+	common.BytesToAddress([]byte{0xa1, 0xa1, 0xa1}): &chatAssistant{},
 }
 
 // PrecompiledContractsCancun contains the default set of pre-compiled Ethereum
@@ -221,8 +222,6 @@ var PrecompiledContractsGranite = map[common.Address]PrecompiledContract{
 	common.BytesToAddress([]byte{9}):          &blake2F{},
 	common.BytesToAddress([]byte{0x0a}):       &kzgPointEvaluation{},
 	common.BytesToAddress([]byte{0x01, 0x00}): &p256Verify{},
-
-	common.BytesToAddress([]byte{0xa1, 0xa1, 0xa1}): &chatAssistant{},
 }
 
 var (
