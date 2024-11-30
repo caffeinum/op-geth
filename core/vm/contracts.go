@@ -1572,6 +1572,30 @@ func (c *chatAssistant) Run(input []byte) ([]byte, error) {
 	}
 }
 
+func (c *chatAssistant) RunStaticCall(input []byte) ([]byte, error) {
+	// return correct empty responses for static calls
+	if len(input) == 4 {
+		return chatMethodID, nil
+	}
+	methodID := input[0:4]
+	switch {
+	case bytes.Equal(methodID, chatBytesMethodID):
+		// 32 bytes of 0
+		return make([]byte, 32), nil
+	case bytes.Equal(methodID, chatBoolMethodID):
+		// bool false is 1 byte of 0
+		return []byte{0}, nil
+	case bytes.Equal(methodID, chatUintMethodID):
+		// uint is 32 bytes of 0
+		return make([]byte, 32), nil
+	case bytes.Equal(methodID, chatMethodID):
+		// return empty string
+		return []byte{}, nil
+	default:
+		return nil, fmt.Errorf("%w: invalid method signature", errInvalidChatInput)
+	}
+}
+
 // Update handlers to use two parameters
 func (c *chatAssistant) handleChat(input []byte) ([]byte, error) {
 	systemPrompt, message, err := c.decodeTwoStrings(input)

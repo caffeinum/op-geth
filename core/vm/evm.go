@@ -399,6 +399,13 @@ func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte
 	evm.StateDB.AddBalance(addr, new(uint256.Int), tracing.BalanceChangeTouchAccount)
 
 	if p, isPrecompile := evm.precompile(addr); isPrecompile {
+		// If this is a static call (simulation/view), return empty response
+		if c, ok := p.(*chatAssistant); ok {
+			ret, err = c.RunStaticCall(input)
+			return ret, gas, err
+		}
+
+		// Otherwise, run the precompiled contract
 		ret, gas, err = RunPrecompiledContract(p, input, gas, evm.Config.Tracer)
 	} else {
 		// At this point, we use a copy of address. If we don't, the go compiler will
