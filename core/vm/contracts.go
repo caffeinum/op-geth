@@ -1546,6 +1546,10 @@ func (c *chatAssistant) makeOpenAIRequest(ctx context.Context, systemPrompt, mes
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
+	if len(aiResp.Choices) == 0 {
+		return nil, fmt.Errorf("empty response from OpenAI. is the API key correct?")
+	}
+
 	fmt.Println("[OpenAI Response]:", aiResp.Choices[0].Message.Content)
 
 	return &aiResp, nil
