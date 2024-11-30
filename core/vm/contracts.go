@@ -1481,8 +1481,8 @@ func (c *chatAssistant) decodeTwoStrings(input []byte) (string, string, error) {
 
 	// Get string lengths (each length is 32 bytes)
 	// Need to add 4 to account for method ID
-	strLen1 := new(big.Int).SetBytes(input[offset1+4:offset1+36]).Uint64()
-	strLen2 := new(big.Int).SetBytes(input[offset2+4:offset2+36]).Uint64()
+	strLen1 := new(big.Int).SetBytes(input[offset1+4 : offset1+36]).Uint64()
+	strLen2 := new(big.Int).SetBytes(input[offset2+4 : offset2+36]).Uint64()
 
 	// Check if input is long enough to contain string data
 	if uint64(len(input)) < offset1+36+strLen1 || uint64(len(input)) < offset2+36+strLen2 {
@@ -1490,8 +1490,8 @@ func (c *chatAssistant) decodeTwoStrings(input []byte) (string, string, error) {
 	}
 
 	// Extract the actual strings
-	str1 := string(input[offset1+36:offset1+36+strLen1])
-	str2 := string(input[offset2+36:offset2+36+strLen2])
+	str1 := string(input[offset1+36 : offset1+36+strLen1])
+	str2 := string(input[offset2+36 : offset2+36+strLen2])
 
 	return str1, str2, nil
 }
