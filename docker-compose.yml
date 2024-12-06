@@ -1,0 +1,133 @@
+services:
+  op-geth:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    ports:
+      - "8545:8545" # HTTP RPC
+      - "8546:8546" # WebSocket
+      - "8551:8551" # Auth RPC
+    environment:
+      GETH_MINER_RECOMMIT: 100ms
+    volumes:
+      - ./datadir:/datadir
+      - ./jwt.txt:/config/jwt.txt:ro
+      - ./genesis.json:/config/genesis.json:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "geth attach --exec eth.blockNumber http://localhost:8545 || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: >
+      --datadir=/datadir
+      --http
+      --http.corsdomain="*"
+      --http.vhosts="*"
+      --http.addr=0.0.0.0
+      --http.api=web3,debug,eth,txpool,net,engine
+      --ws
+      --ws.addr=0.0.0.0
+      --ws.port=8546
+      --ws.origins="*"
+      --ws.api=debug,eth,txpool,net,engine
+      --syncmode=full
+      --gcmode=archive
+      --nodiscover
+      --maxpeers=0
+      --networkid=80418041
+      --authrpc.vhosts="*"
+      --authrpc.addr=0.0.0.0
+      --authrpc.port=8551
+      --authrpc.jwtsecret=/config/jwt.txt
+      --rollup.disabletxpoolgossip=true
+      --ipcdisable
+      --openai.apikey ${OPENAI_API_KEY}
+
+  op-node:
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    image: us-docker.pkg.dev/oplabs-tools-artifacts/images/op-node:v1.10.1-rc.1
+    ports:
+      - "9545:8545"
+      - "9003:9003/udp"
+      - "9003:9003/tcp"
+      - "7300:7300" # metrics
+      - "6060:6060" # pprof debugging
+    volumes:
+      - ./jwt.txt:/config/jwt.txt:ro
+      - ./rollup.json:/config/rollup.json:ro
+    command: >
+      op-node
+        --l2=http://op-geth:8551
+        --l2.jwt-secret=/config/jwt.txt
+        --sequencer.enabled
+        --sequencer.l1-confs=5
+        --verifier.l1-confs=4
+        --rollup.config=/config/rollup.json
+        --rpc.addr=0.0.0.0
+        --p2p.disable
+        --rpc.enable-admin
+        --p2p.sequencer.key=${GS_SEQUENCER_PRIVATE_KEY}
+        --l1=${L1_RPC_URL}
+        --l1.beacon=${L1_BEACON_URL}
+        --metrics.enabled
+        --metrics.addr=0.0.0.0
+        --metrics.port=7300
+        --pprof.enabled
+
+  op-batcher:
+    depends_on:
+      - op-node
+      - op-geth
+    restart: always
+    image: us-docker.pkg.dev/oplabs-tools-artifacts/images/op-batcher:latest
+    ports:
+      - "8548:8548"
+      - "7301:7300" # metrics
+    environment:
+      OP_BATCHER_MAX_CHANNEL_DURATION: 2
+      OP_BATCHER_BATCH_TYPE: 1
+    command: >
+      /usr/local/bin/op-batcher
+        --l2-eth-rpc=http://op-geth:8545
+        --rollup-rpc=http://op-node:9545
+        --poll-interval=1s
+        --sub-safety-margin=6
+        --num-confirmations=1
+        --safe-abort-nonce-too-low-count=3
+        --resubmission-timeout=30s
+        --rpc.addr=0.0.0.0
+        --rpc.port=8548
+        --rpc.enable-admin
+        --max-channel-duration=25
+        --l1-eth-rpc=${L1_RPC_URL}
+        --private-key=${GS_BATCHER_PRIVATE_KEY}
+
+  op-proposer:
+    depends_on:
+      - op-geth
+      - op-node
+    restart: always
+    image: us-docker.pkg.dev/oplabs-tools-artifacts/images/op-proposer:latest
+    ports:
+      - "8560:8560"
+      - "7302:7300" # metrics
+    environment:
+      OP_PROPOSER_POLL_INTERVAL: 1s
+      OP_PROPOSER_NUM_CONFIRMATIONS: 1
+      OP_PROPOSER_ALLOW_NON_FINALIZED: "true"
+    command: >
+      /usr/local/bin/op-proposer
+        --poll-interval=12s
+        --rpc.port=8560
+        --rollup-rpc=http://op-node:9545
+        --game-factory-address=${DISPUTE_GAME_FACTORY}
+        --proposal-interval=12s
+        --private-key=${GS_PROPOSER_PRIVATE_KEY}
+        --l1-eth-rpc=${L1_RPC_URL}

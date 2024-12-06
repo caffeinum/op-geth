@@ -1,0 +1,35 @@
+##################################################
+
+# Admin account
+export GS_ADMIN_ADDRESS=
+export GS_ADMIN_PRIVATE_KEY=
+# Batcher account
+export GS_BATCHER_ADDRESS=
+export GS_BATCHER_PRIVATE_KEY=
+# Proposer account
+export GS_PROPOSER_ADDRESS=
+export GS_PROPOSER_PRIVATE_KEY=
+# Sequencer account
+export GS_SEQUENCER_ADDRESS=
+export GS_SEQUENCER_PRIVATE_KEY=
+
+##################################################
+#              op-node Configuration             #
+##################################################
+
+# The kind of RPC provider, used to inform optimal transactions receipts
+# fetching. Valid options: alchemy, quicknode, infura, parity, nethermind,
+# debug_geth, erigon, basic, any.
+export L1_RPC_KIND=alchemy
+
+# RPC URL for the L1 network to interact with
+export L1_RPC_URL=
+
+export L1_BEACON_URL=
+
+##################################################
+# OpenAI API Key
+export OPENAI_API_KEY=
+
+# Add this with the other environment variables
+export DISPUTE_GAME_FACTORY=$(cat .deploy | jq -r .opChainDeployment.disputeGameFactoryProxyAddress)

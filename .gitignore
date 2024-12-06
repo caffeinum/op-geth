@@ -62,3 +62,16 @@ tests/spec-tests/
 datadir
 genesis.json
 jwt.txt
+
+.envrc
+
+genesis.json
+rollup.json
+.deploy
+
+l2-allocs.json
+chain-config.json
+
+
+l1-geth
+l1-lighthouse
