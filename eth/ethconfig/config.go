@@ -64,7 +64,7 @@ var Defaults = Config{
 	TxPool:             legacypool.DefaultConfig,
 	BlobPool:           blobpool.DefaultConfig,
 	RPCGasCap:          50000000,
-	RPCEVMTimeout:      5 * time.Second,
+	RPCEVMTimeout:      15 * time.Second,
 	GPO:                FullNodeGPO,
 	RPCTxFeeCap:        1, // 1 ether
 }

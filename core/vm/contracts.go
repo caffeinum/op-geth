@@ -17,12 +17,20 @@
 package vm
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"math/big"
+	"net/http"
+	"strings"
+	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	bls12381 "github.com/consensys/gnark-crypto/ecc/bls12-381"
@@ -36,9 +44,64 @@ import (
 	"github.com/ethereum/go-ethereum/crypto/bn256"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/crypto/secp256r1"
+
 	"github.com/ethereum/go-ethereum/params"
 	"golang.org/x/crypto/ripemd160"
 )
+
+// OpenAI API request/response structures
+type OpenAIRequest struct {
+	Model     string    `json:"model"`
+	Seed      int       `json:"seed"`
+	MaxTokens int       `json:"max_tokens"`
+	Messages  []Message `json:"messages"`
+}
+
+type Message struct {
+	Role    string  `json:"role"`
+	Content string  `json:"content"`
+	Refusal *string `json:"refusal,omitempty"`
+}
+
+type OpenAIResponse struct {
+	ID                string   `json:"id"`
+	Object            string   `json:"object"`
+	Created           int64    `json:"created"`
+	Model             string   `json:"model"`
+	Choices           []Choice `json:"choices"`
+	Usage             Usage    `json:"usage"`
+	SystemFingerprint string   `json:"system_fingerprint"`
+	Error             *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type Choice struct {
+	Index        int     `json:"index"`
+	Message      Message `json:"message"`
+	LogProbs     *string `json:"logprobs"`
+	FinishReason string  `json:"finish_reason"`
+}
+
+type Usage struct {
+	PromptTokens           int                    `json:"prompt_tokens"`
+	CompletionTokens       int                    `json:"completion_tokens"`
+	TotalTokens            int                    `json:"total_tokens"`
+	PromptTokensDetails    TokenDetails           `json:"prompt_tokens_details"`
+	CompletionTokenDetails CompletionTokenDetails `json:"completion_tokens_details"`
+}
+
+type TokenDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+	AudioTokens  int `json:"audio_tokens"`
+}
+
+type CompletionTokenDetails struct {
+	ReasoningTokens          int `json:"reasoning_tokens"`
+	AudioTokens              int `json:"audio_tokens"`
+	AcceptedPredictionTokens int `json:"accepted_prediction_tokens"`
+	RejectedPredictionTokens int `json:"rejected_prediction_tokens"`
+}
 
 // PrecompiledContract is the basic interface for native Go contracts. The implementation
 // requires a deterministic gas count based on the input size of the Run method of the
@@ -163,17 +226,18 @@ var PrecompiledContractsFjord = map[common.Address]PrecompiledContract{
 // PrecompiledContractsGranite contains the default set of pre-compiled Ethereum
 // contracts used in the Granite release.
 var PrecompiledContractsGranite = map[common.Address]PrecompiledContract{
-	common.BytesToAddress([]byte{1}):          &ecrecover{},
-	common.BytesToAddress([]byte{2}):          &sha256hash{},
-	common.BytesToAddress([]byte{3}):          &ripemd160hash{},
-	common.BytesToAddress([]byte{4}):          &dataCopy{},
-	common.BytesToAddress([]byte{5}):          &bigModExp{eip2565: true},
-	common.BytesToAddress([]byte{6}):          &bn256AddIstanbul{},
-	common.BytesToAddress([]byte{7}):          &bn256ScalarMulIstanbul{},
-	common.BytesToAddress([]byte{8}):          &bn256PairingGranite{},
-	common.BytesToAddress([]byte{9}):          &blake2F{},
-	common.BytesToAddress([]byte{0x0a}):       &kzgPointEvaluation{},
-	common.BytesToAddress([]byte{0x01, 0x00}): &p256Verify{},
+	common.BytesToAddress([]byte{1}):                &ecrecover{},
+	common.BytesToAddress([]byte{2}):                &sha256hash{},
+	common.BytesToAddress([]byte{3}):                &ripemd160hash{},
+	common.BytesToAddress([]byte{4}):                &dataCopy{},
+	common.BytesToAddress([]byte{5}):                &bigModExp{eip2565: true},
+	common.BytesToAddress([]byte{6}):                &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{7}):                &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{8}):                &bn256PairingGranite{},
+	common.BytesToAddress([]byte{9}):                &blake2F{},
+	common.BytesToAddress([]byte{0x0a}):             &kzgPointEvaluation{},
+	common.BytesToAddress([]byte{0x01, 0x00}):       &p256Verify{},
+	common.BytesToAddress([]byte{0xa1, 0xa1, 0xa1}): &chatAssistant{},
 }
 
 var (
@@ -1352,4 +1416,415 @@ func (c *p256Verify) Run(input []byte) ([]byte, error) {
 		// Signature is invalid
 		return nil, nil
 	}
+}
+
+type chatAssistant struct{}
+
+var (
+	errInvalidChatInput = errors.New("invalid chat input")
+	errOpenAITimeout    = errors.New("openai request timed out")
+)
+
+var (
+	chatMethodID      = crypto.Keccak256([]byte("chat(string,string)"))[0:4]
+	chatBytesMethodID = crypto.Keccak256([]byte("chat_bytes(string,string)"))[0:4]
+	chatBoolMethodID  = crypto.Keccak256([]byte("chat_bool(string,string)"))[0:4]
+	chatUintMethodID  = crypto.Keccak256([]byte("chat_uint(string,string)"))[0:4]
+)
+
+func (c *chatAssistant) RequiredGas(input []byte) uint64 {
+	// Base cost for the API call
+	baseCost := uint64(2000)
+	// Decode the input to get actual string lengths
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return 2000 // base cost for invalid input
+	}
+
+	// input tokens = systemPrompt + message
+	// output tokens = max 512 tokens
+	// input tokens are 0.15$ per 1M tokens
+	// output tokens are 0.60$ per 1M tokens
+	charToTokenRatio := uint64(4)
+
+	// convert input bytes to tokens
+	inputTokens := (uint64(len(systemPrompt)) + uint64(len(message))) / charToTokenRatio
+
+	// calculate output tokens as 4x input tokens cause 4x more expensive
+	outputTokens := uint64(512) * 60 / 15
+
+	totalTokens := inputTokens + outputTokens
+
+	// Calculate based on input size
+	usdCost := totalTokens * 15 / 100000000
+
+	gasCost := usdCost * 1e9 / 3000 // 3000 USD per ETH
+
+	return baseCost + gasCost
+}
+
+// Add helper to decode two strings
+func (c *chatAssistant) decodeTwoStrings(input []byte) (string, string, error) {
+	if len(input) < 68 {
+		return "", "", fmt.Errorf("%w: input too short for offsets", errInvalidChatInput)
+	}
+
+	// Skip method ID (4 bytes) and get string offsets
+	// Each offset is 32 bytes, pointing to where each string starts
+	offset1 := new(big.Int).SetBytes(input[4:36]).Uint64()
+	offset2 := new(big.Int).SetBytes(input[36:68]).Uint64()
+
+	// Check if input is long enough to contain both strings
+	if uint64(len(input)) < offset1+32 || uint64(len(input)) < offset2+32 {
+		return "", "", fmt.Errorf("%w: input too short for string lengths", errInvalidChatInput)
+	}
+
+	// Get string lengths (each length is 32 bytes)
+	// Need to add 4 to account for method ID
+	strLen1 := new(big.Int).SetBytes(input[offset1+4 : offset1+36]).Uint64()
+	strLen2 := new(big.Int).SetBytes(input[offset2+4 : offset2+36]).Uint64()
+
+	// Check if input is long enough to contain string data
+	if uint64(len(input)) < offset1+36+strLen1 || uint64(len(input)) < offset2+36+strLen2 {
+		return "", "", fmt.Errorf("%w: input too short for string data", errInvalidChatInput)
+	}
+
+	// Extract the actual strings
+	str1 := string(input[offset1+36 : offset1+36+strLen1])
+	str2 := string(input[offset2+36 : offset2+36+strLen2])
+
+	return str1, str2, nil
+}
+
+func (c *chatAssistant) makeOpenAIRequest(ctx context.Context, systemPrompt, message string) (*OpenAIResponse, error) {
+	fmt.Println("[OpenAI System Prompt]:", systemPrompt)
+	fmt.Println("[OpenAI Message]:", message)
+
+	reqBody := OpenAIRequest{
+		Model:     "gpt-4o-mini",
+		Seed:      13371337,
+		MaxTokens: 512,
+		Messages: []Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: message},
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", params.OpenAIAPIURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if params.OpenAIAPIURL == "" || params.OpenAIAPIKey == "" {
+		return nil, fmt.Errorf("OpenAI API URL or key is not set")
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+params.OpenAIAPIKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, errOpenAITimeout
+		}
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var aiResp OpenAIResponse
+	if err := json.Unmarshal(body, &aiResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if len(aiResp.Choices) == 0 {
+		return nil, fmt.Errorf("empty response from OpenAI. is the API key correct?")
+	}
+
+	fmt.Println("[OpenAI Response]:", aiResp.Choices[0].Message.Content)
+
+	return &aiResp, nil
+}
+
+func (c *chatAssistant) Run(input []byte) ([]byte, error) {
+	if len(input) < 4 {
+		return nil, fmt.Errorf("%w: input too short, length=%d", errInvalidChatInput, len(input))
+	}
+
+	methodID := input[0:4]
+	switch {
+	case bytes.Equal(methodID, chatMethodID):
+		return c.handleChat(input)
+	case bytes.Equal(methodID, chatBytesMethodID):
+		return c.handleChatBytes(input)
+	case bytes.Equal(methodID, chatBoolMethodID):
+		return c.handleChatBool(input)
+	case bytes.Equal(methodID, chatUintMethodID):
+		return c.handleChatUint(input)
+	default:
+		return nil, fmt.Errorf("%w: invalid method signature", errInvalidChatInput)
+	}
+}
+
+func (c *chatAssistant) RunStaticCall(input []byte) ([]byte, error) {
+	// return correct empty responses for static calls
+	if len(input) < 4 {
+		return nil, fmt.Errorf("%w: input too short, length=%d", errInvalidChatInput, len(input))
+	}
+
+	methodID := input[0:4]
+	switch {
+	case bytes.Equal(methodID, chatMethodID):
+		response := ""
+		strLen := uint64(len(response))
+		paddedStrLen := (strLen + 31) / 32 * 32
+
+		encoded := make([]byte, 64+paddedStrLen)
+		binary.BigEndian.PutUint64(encoded[24:32], 32)
+		binary.BigEndian.PutUint64(encoded[56:64], strLen)
+		copy(encoded[64:], response)
+
+		return encoded, nil
+	case bytes.Equal(methodID, chatBytesMethodID):
+		encoded := make([]byte, 32)
+		return encoded, nil
+	case bytes.Equal(methodID, chatBoolMethodID):
+		encoded := make([]byte, 32)
+		return encoded, nil
+	case bytes.Equal(methodID, chatUintMethodID):
+		encoded := make([]byte, 32)
+		return encoded, nil
+
+	default:
+		return nil, fmt.Errorf("%w: invalid method signature", errInvalidChatInput)
+	}
+}
+
+// Update handlers to use two parameters
+func (c *chatAssistant) handleChat(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	if systemPrompt == "" {
+		systemPrompt = "You are a helpful assistant."
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+
+	// Ensure response doesn't exceed maximum size
+	const maxResponseSize = 512 * 4
+	if len(response) > maxResponseSize {
+		response = response[:maxResponseSize]
+	}
+
+	// ABI encode the string response
+	strLen := uint64(len(response))
+	paddedStrLen := (strLen + 31) / 32 * 32
+
+	encoded := make([]byte, 64+paddedStrLen)
+	binary.BigEndian.PutUint64(encoded[24:32], 32)
+	binary.BigEndian.PutUint64(encoded[56:64], strLen)
+	copy(encoded[64:], response)
+
+	return encoded, nil
+}
+
+func (c *chatAssistant) handleChatBytes(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	systemPrompt += `
+You are a smart contract helper that MUST return hex data.
+IMPORTANT: Your response should end with a single line containing ONLY a hex string.
+- The hex string can optionally start with '0x'
+- Use only characters 0-9 and a-f (or A-F)
+- The length must be even (pad with leading 0 if needed)
+
+Examples of valid final lines:
+0x0123456789abcdef
+0x00
+0xdeadbeef
+deadbeef
+00
+
+After any explanation, your last line MUST follow this format.`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+	lines := strings.Split(response, "\n")
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("empty response")
+	}
+
+	// Get the last non-empty line
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+
+	// Remove 0x prefix if present
+	lastLine = strings.TrimPrefix(lastLine, "0x")
+
+	// Clean the hex string
+	cleanedHex := strings.Map(func(r rune) rune {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			return r
+		}
+		return -1
+	}, lastLine)
+
+	// Ensure even length by padding with leading zero if needed
+	if len(cleanedHex)%2 != 0 {
+		cleanedHex = "0" + cleanedHex
+	}
+
+	if cleanedHex == "" {
+		return nil, fmt.Errorf("invalid hex string: no valid hex characters found")
+	}
+
+	// Decode hex string
+	return hex.DecodeString(cleanedHex)
+}
+
+func (c *chatAssistant) handleChatBool(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	systemPrompt += `
+You are a smart contract helper that MUST return true or false.
+IMPORTANT: After any explanation, your response MUST end with a single line containing ONLY the word 'true' or 'false' (lowercase).
+
+Examples of valid final lines:
+true
+false
+
+Your last line MUST be exactly 'true' or 'false' - nothing else.`
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+	lines := strings.Split(response, "\n")
+
+	// Get the last non-empty line
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+
+	result := strings.ToLower(lastLine) == "true"
+	encoded := make([]byte, 32)
+	if result {
+		encoded[31] = 1
+	}
+
+	return encoded, nil
+}
+
+func (c *chatAssistant) handleChatUint(input []byte) ([]byte, error) {
+	systemPrompt, message, err := c.decodeTwoStrings(input)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Second)
+	defer cancel()
+
+	systemPrompt += `
+You are a smart contract helper that MUST return a non-negative integer.
+IMPORTANT: After any explanation, your response MUST end with a single line containing ONLY digits (0-9).
+- No decimal points
+- No commas
+- No text or units
+- No scientific notation
+- Just plain digits
+
+Examples of valid final lines:
+0
+123456789
+1000000
+
+Your last line MUST contain ONLY digits - nothing else.`
+
+	aiResp, err := c.makeOpenAIRequest(ctx, systemPrompt, message)
+	if err != nil {
+		return nil, err
+	}
+
+	response := aiResp.Choices[0].Message.Content
+	lines := strings.Split(response, "\n")
+
+	// Get the last non-empty line
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			lastLine = trimmed
+			break
+		}
+	}
+
+	// Parse the uint, removing any non-numeric characters
+	cleanedLine := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, lastLine)
+
+	if cleanedLine == "" {
+		return nil, fmt.Errorf("invalid uint value: no numeric value found")
+	}
+
+	value := new(big.Int)
+	value, ok := value.SetString(cleanedLine, 10)
+	if !ok || value.Sign() < 0 {
+		return nil, fmt.Errorf("invalid uint value: %s", lastLine)
+	}
+
+	encoded := make([]byte, 32)
+	value.FillBytes(encoded)
+
+	return encoded, nil
 }
