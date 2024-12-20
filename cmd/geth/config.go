@@ -284,7 +284,11 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 
 	// Set OpenAI API key from flags
 	if ctx.IsSet(utils.OpenAIAPIKeyFlag.Name) {
+		log.Info("OpenAI API key is configured")
+
 		params.SetOpenAIAPIKey(ctx.String(utils.OpenAIAPIKeyFlag.Name))
+	} else {
+		log.Warn("OpenAI API key is not set - some features may be limited")
 	}
 
 	return stack
